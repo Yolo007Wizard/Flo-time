@@ -1,0 +1,610 @@
+# Elixir Flo-time
+
+## Intro
+
+Elixir Flotime is a low-code solution used to build 'flo pipelines' built on top of Elixir GenStage. Users without any coding knowledge can quickly deploy business logic to a prod environment. At the same time, more advanced users have access to a traditional software stack with an SDK. Similar product inspirations: Apache Airflow, Snaplogic, Chronicle SOAR, Phantom SOAR, and Node-Red.
+
+**Feature Set:**
+
+* A low-code web gui builder
+* Multi tenancy environments
+* Liveview monitor and report dashboards
+* Pipeline backpressure + configurable concurrency
+* Subflo pipelines within pipelines
+* Developer SDK for custom stages
+* All changes / updates tracked through git repository
+
+## Motivation
+
+The main benefits of a low-code solution are faster dev cycles and easier maintenance. Those two benefits have proven to be valuable as the market has risen year over year.
+
+Low-code solutions inherently require many abstractions that create inefficiency, and this makes it difficult to scale a system while keeping costs down.
+
+The goal of Elixir Flotime is to do it better with Elixir's amazing ecosystem.
+
+## Flo Events
+
+Under the hood, everything in Elixir Flotime is an event with the basic structure:
+
+```elixir
+{
+  "id": "uid",
+  "data": {},
+  "meta_data": {},
+  "time_stamp": "1999-01-08 04:05:06"
+}
+```
+
+Every event is wrapped inside a 'transit tuple' with status and transit info:
+
+```elixir
+{:ok, event, transit_data}
+{:error, event, transit_data}
+{:warning, event, transit_data}
+```
+
+Events pass through Flotime pipelines that contain business logic defined by user input.
+
+## High Level Architecture
+
+<!-- Learn more at https://mermaid-js.github.io/mermaid -->
+
+```mermaid
+flowchart LR;
+  
+  external_events -->envQueueA --> T[Trigger Engine]
+  external_events -->envQueueB --> T[Trigger Engine]
+  external_events -->envQueueC --> T[Trigger Engine]
+
+  subgraph E[DB Queues]
+    direction TB
+    envQueueA
+    envQueueB
+    envQueueC
+  end
+
+  internal_events --> E[DB Queues]
+
+  subgraph f[DB Queues]
+    floQueue1
+    floQueue2
+    floQueue3
+  end
+  
+  T[Trigger Engine] --> floQueue1 --> p[Flo Pipeline Engine] --> r[runtime log db]
+  T[Trigger Engine] --> floQueue2 --> p[Flo Pipeline Engine]
+  T[Trigger Engine] --> floQueue3 --> p[Flo Pipeline Engine]
+  p[Flo Pipeline Engine] -- subflos -->f[DB Queues]
+
+  x[flo definitions] --> T[Trigger Engine]
+  y[flo definitions] --> p[Flo Pipeline Engine]
+  
+  
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+Notes:
+
+* Phoenix hosts event-post apis, live dashboards etc.
+* If larger ingest scale is required, Broadway can ingest directly to environment queues.
+* Postgres is the DB for all persistance needs.
+
+## Flo Definitions
+
+Flo definitions (floDefs) are what define user input logic from the web builder. They are modular contract json schemas passed between the front and back end. FloDefs are consumed by engines and provide instruction for pipeline exectuion.
+
+Each floDef has this basic structure:
+
+```elixir
+{
+  "id": "pipeline + 8 digit hex",
+  "name": "pipeline name",
+  "environment": "env name", # accepts * to apply to all envs
+  "trigger": {}, # trigger conditions for pipeline execution
+  "mappers": [], # map external event fields to a static internal entity field
+  "stages": [], # pipeline GenStages 
+}
+```
+
+To illustrate the relationship between definitions and engines, here is a 'match_eval' example. This is an input definition used in mappers and triggers.
+
+```elixir
+{
+  "type": "match_eval",
+  "left": "input1", # web builder input
+  "operator": "=", # web builder input
+  "right": "input2", # web builder input
+}
+```
+
+During engine runtime, this definition gets passed to a dedicated function. Here is an example of the 'match_eval' handler code:
+
+```elixir
+defmodule FlotimeEngine do
+  def match_eval?(%{
+        "type" => "match_eval",
+        "left" => left,
+        "operator" => operator,
+        "right" => right
+      }) do
+    case operator do
+      "=" ->
+        left == right
+
+      "!=" ->
+        left != right
+
+      ">" ->
+        left > right
+
+      "<" ->
+        left < right
+
+      "in" ->
+        String.contains?(right, left)
+        # more operator expressions
+    end
+  end
+
+  # other handlers
+end
+```
+
+## Json Pointers
+
+[Json-pointers](https://datatracker.ietf.org/doc/html/draft-ietf-appsawg-json-pointer-08) are a great fit for low code and will be an important UX peice in the web builder. In the front end, the event payload gets turned into a drag-n-drop string representation. Inspiration is heavily taken from [Snaplogic Mapper](https://youtu.be/HrpCbNdRhYo?t=67) (but they use jsonPath)
+
+```elixir
+# hypothetical event payload
+{
+  "event_data": {
+    "field1": "12345",
+    "field2": ["a", "b", "c"]
+  }
+}
+
+# user drags and drops json-pointer property strings as needed into frontend widget
+# the widget builds this definition:
+{
+  "type": "match_eval",
+  "left": "~jp[payload_name/field2/1]", # widget input
+  "operator": "=", # widget input
+  "right": "b", # widget input
+}
+```
+
+Note the use of ~jp[] for easy regex match + resolve later on
+
+## FloStage Definitions
+
+Stages are where all the low-code magic happens in Flotime. Flo pipelines are made out of modular pre-defined GenStages that a user can drag-n-drop as needed in the frontend web builder.
+
+Before it can be used in the web builder, a stage definition is first created by a developer like so:
+
+```elixir
+{
+  "module": "MathOperators", # CamelCase integration/library name
+  "def": "multiplier", # snake_case function name
+  "description": "takes an input number and times it by multiplier"
+  "inputs": {
+    "number": "~jp[event/key]", #default
+    "multiplier": 2 #default
+  }
+}
+```
+
+Then the developer writes the handler code. Every handler function takes a single event plus the definition input map as parameters.
+
+```elixir
+defmodule MathOperators do
+  # contains utility functions
+  use FlotimeSDK
+
+  def multiplier(event, inputs) do
+    Map.update(event, Integer.parse(inputs["number"]), 0, &(&1 * inputs["multiplier"]))
+    {:ok, event}
+  end
+
+  # other MathOperator functions
+end
+```
+
+Once the definition + handler code is complete, it gets checked into a git repository. From there a standard CI / CD pipeline updates the Flotime app, and then the new stage will be available for front end users.
+
+In the front end, a user drags and drops FloStages in the web GUI to build a pipeline. Behind the scenes the front end framework completes the FloDefinition.
+
+```elixir
+{
+  "id": "pipeline8dighex", # queue / flo pipeline id
+  "name": "My first flo",
+  "environment": "name",
+  "trigger": {},
+  "mappers": [],
+  "stages": [
+      {
+        "id": "stage8dighex", #instance id added during gui build
+        "module": "MathOperators", # CamelCase integration name
+        "def": "multiplier", # snake_case function name
+        "description": "takes an input number and times it by multiplier"
+        "inputs": {
+          "number": "~jp[event/key]",
+          "multiplier": 2 #default
+        },
+        "subscriptions": [ #GenStage subscriptions
+          {"to": "stage8dighex", "partition": "", "route": "", "min_demand": 5, "max_demand": 10}
+        ]
+      },
+      {
+        "id": "stage8dighex", #some other stage
+        "module": "Flotime",
+        "def": "router"
+      }
+    ]
+}
+```
+
+**Flo Marketplace**
+
+The long term idea is that developers can contribute FloStages to an open source markeplace on github. This will integrate with the web builder frontend and allow users to easily install new FloStages.
+
+## Flo Engine
+
+Once the flo definition is completed in the GUI frontend, it gets checked into the master git repository and passed to the FloEngine. This is where the definition gets dynamically built into an Elixir Genstage pipeline.
+
+```elixir
+defmodule FloEngine do
+  # create new DB flo queue
+  # save triggers and mappers to DB tables
+  # create FloStages
+  # custom or built in: router, subflo, internal_event etc
+  # create producer
+  # start pipeline
+end
+```
+
+FloStages get dynamically built from each stage definition
+
+```elixir
+defmodule FloStage do
+  use GenStage
+
+  def start_link do
+    # a single stage definition passed as input
+    GenStage.start_link(__MODULE__, stage)
+  end
+
+  @impl true
+  def init(stage) do
+    {:producer_consumer, stage, subscribe_to: stage["subscriptions"]}
+  end
+
+  @impl true
+  def handle_events(events, _from, stage) do
+    events =
+      events
+      # for each transit tuple
+      |> Enum.map(fn {status, event, transit_data} ->
+        event
+        # reroutes {:error, event, transit_data} to runtime log DB table
+        |> valid()
+        # resolves ~jp[] json-pointers
+        |> resolve_pointers(stage["inputs"])
+        |> apply(stage["module"], stage["def"], [event, stage["inputs"]])
+      end)
+
+    {:noreply, events, stage}
+  end
+end
+```
+
+## Input Definitions
+
+Input definitions are used in mappers, triggers, and Flotime components (stage routers, subflos). They capture user input and pass to the engine for evaluation.
+
+```elixir
+"inputs": { # generic stage input with defaults
+  "event_field": "~jp[event/key]",
+  "input": "some stage user input",
+  "number": 5
+}
+```
+
+```elixir
+{
+  "type": "match_eval",
+  "left": "input1",
+  "operator": "=", #supports >, >=, <, <=, in, !=, none (includes string empty, null, or not found)
+  "right": "input2",
+}
+```
+
+```elixir
+{
+    "type": "set_eval",
+    "operator": "AND",
+    "conditions": [ #supports type match_eval or another sub set_eval
+        {
+            "type": "match_eval",
+            "left": "~jp[event/one]",
+            "operator": "=",
+            "right": "1",
+        },
+        {
+            "type": "set_eval",
+            "operator": "OR",
+            "conditions": [
+                {
+                    "type": "match_eval",
+                    "left": "1",
+                    "operator": "!=",
+                    "right": "1"
+                },
+                {
+                    "type": "match_eval",
+                    "left": "2",
+                    "operator": "=",
+                    "right": "2"
+                },
+            ]
+        },
+    ]
+}
+```
+
+## Triggers and Mappers
+
+Trigger example:
+
+```elixir
+{
+  "id": "pipeline8dighex", # queue / flo pipeline id
+  "name": "My first flo",
+  "environment": "name",
+  "trigger": {
+    "type": "set_eval",
+    "operator": "AND",
+    "conditions": [
+        {
+            "type": "match_eval",
+            "left": "~jp[event/one]",
+            "operator": "=",
+            "right": "1",
+        },
+        {
+            "type": "set_eval",
+            "operator": "OR",
+            "conditions": [
+                {
+                    "type": "match_eval",
+                    "left": "1",
+                    "operator": "!=",
+                    "right": "1"
+                },
+                {
+                    "type": "match_eval",
+                    "left": "2",
+                    "operator": "=",
+                    "right": "2"
+                },
+            ]
+        },
+    ]
+  },
+  "mappers": [],
+  "stages": []
+}
+```
+
+Mapper example:
+
+```elixir
+{
+    "type": "mapper",
+    "from": ["~jp[event/field/1]", "~jp[event/field/2]"], #first found/valid match
+    "to": "~jp[event/meta_data/entities/map_to_key]"
+}
+```
+
+```elixir
+{
+    "type": "transformer",
+    "from": ["~jp[event/field/1]", "~jp[event/field/2]"], #first found/valid match
+    "operator": "to_int, to_string, regex_replace, to_ip, ...other operators",
+    "to": "~jp[event/meta_data/entities/map_to_key]"
+}
+```
+
+```elixir
+{
+  "id": "pipeline8dighex",
+  "name": "My first flo",
+  "environment": "name",
+  "trigger": {},
+  "mappers": [
+    {
+      "type": "mapper",
+      "from": ["~jp[event/field/1]", "~jp[event/field/2]"], #first found/valid match
+      "to": "~jp[event/meta_data/entities/map_to_key]"
+    },
+    {
+      "type": "transformer",
+      "from": ["~jp[event/field/1]", "~jp[event/field/2]"], #first found/valid match
+      "operator": "to_int, to_string, regex_replace, to_ip, ...other operators",
+      "to": "~jp[event/meta_data/entities/map_to_key]"
+    }
+  ],
+  "stages": []
+}
+```
+
+## Trigger Engine
+
+The trigger engine is built out of GenStage pipelines between each queue. Trigger and Mapper definitions are stored in the DB and are pulled into each producer-consumer dynamicaly for evaluation.
+
+<!-- livebook:{"break_markdown":true} -->
+
+<!-- Learn more at https://mermaid-js.github.io/mermaid -->
+
+```mermaid
+flowchart LR;
+  subgraph sg[Trigger Engine]
+      direction LR
+      p1 --> t1[TriggerCheck] --> m1[Mappers] --> c1
+      p2 --> t2[TriggerCheck] --> m2[Mappers] --> c2
+    end
+  eq1[environment queue A] --> p1
+  eq2[environment queue B] --> p2
+  c1 --> fq1[flo queue 1]
+  c1 --> fq2[flo queue 2]
+  c2 --> fq2[flo queue 2]
+  c2 --> fq3[flo queue 3]
+  db[DB Definitions] --> sg
+  
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+If an event has no triggers, it gets routed directly to the runtime log table in the DB (the end of all flos)
+
+## Router Definition
+
+FloRouters are conditional 'if widgets' in the front end. Events can be routed down different flo branches if a trigger condition is met. The chosen route is the first trigger to equal true. In the backend, FloRouters are special types of GenStages. The engine will check if module = Flotime for special stages.
+
+<!-- livebook:{"break_markdown":true} -->
+
+<!-- Learn more at https://mermaid-js.github.io/mermaid -->
+
+```mermaid
+flowchart LR;
+  floqueue --> producer --> stage1 --> floRouter --route1--> stageA --> stageB
+  floRouter --route2--> stageC
+
+```
+
+```elixir
+{
+  "id": "stage8dighex", 
+  "module": "Flotime",
+  "def": "router",
+  "description": "Used to conditionally route events to different flo routes"
+  "routes": [ # chosen route is first trigger to = true
+    {
+      "route": "route1",
+      "trigger": {} # supports match_eval or set_eval
+    },
+    {
+      "route": "route2",
+      "trigger": {}
+    }
+  ],
+  "subscriptions": [ #stage link / relationships
+    {"to": "prev_stage", "partition": "", "route": "", "min_demand": 5, "max_demand": 10},
+  ]
+}
+```
+
+Note the optional 'route' parameter in subscritpions. This allows the next stages to subscribe to specific routes.
+
+Its undecided still if the FloRouter stage will use BroadcastDispatcher selectors or a PartitionDispatcher for the actual routing.
+
+## Sub-flo Pipelines
+
+Subflo piplines can be embeded into any parent flo (within a nested config limit). This is accomplished by sending events to another flo queue, and once done the event is requeued to the original parent flo (skipping previous work).
+
+<!-- livebook:{"break_markdown":true} -->
+
+<!-- Learn more at https://mermaid-js.github.io/mermaid -->
+
+```mermaid
+flowchart LR
+  queue1
+  queue2
+  queue3[queue1]
+
+  subgraph flo1
+    direction LR
+    f1p[producer]
+    f1s1[stage1]
+    f1sf[subflo]
+    f1s2[stage2]
+    f1s3[stage3]
+  end
+  subgraph flo2
+    direction LR
+    f2p[producer]
+    f2s1[stage1]
+  end
+  subgraph flo3[flo1]
+    direction LR
+    f3p[producer]
+    f3s1[stage1]
+    f3sf[subflo]
+    f3s2[stage2]
+    f3s3[stage3]
+  end
+
+  queue1 --> f1p[producer] --> f1s1[stage1]--> f1sf[subflo]
+  f1p[producer] -.->f1s2[stage2] -.-> f1s3[stage3]
+  queue2 --> f2p[producer] --> f2s1[stage1]
+  f1sf[subflo] --> queue2
+  f2s1[stage1] --> queue3[queue1] --> f3p[producer] -.-> f3s1 -.-> f3sf
+  f3p[producer] --> f3s2 --> f3s3
+
+  
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+The diagram above shows how the GenStages will be arranged under the hood, however the front end web GUI and the floDef will display stages in sequential order: stage1 --> subflo --> stage2 --> stage3
+
+Since every event is wrapped inside a transit tuple, the requeue information is easily stored in the transit_data variable.
+
+```elixir
+{:ok, event, transit_data} # transit tuple
+
+transit_data = {
+  "log": [ # queue log
+    {"id": "flo1", "timestamp": "timestamp"},
+    {"id": "flo2", "timestamp": "timestamp"},
+    {"id": "flo1", "timestamp": "timestamp"}
+  ],
+  "requeue_flos": [ # max list length is set by a config variable
+    {"id": "pipeline8dighex", "stage": "stage8dighex"} # requeue info: queue_id, partition
+  ],
+  "warnings": [],
+  "errors": []
+}
+
+
+```
+
+**Technical details:**
+
+Every pipeline producer uses a partition dispatcher by default with a partition dedicated to each subflo stage. This allows events to skip work thats been done already during the requeue (2nd pass) process.
+
+Every pipeline has defualt exit consumers which check to see if any parent flos in the transit_data. If found the consumer will requeue the event to the parent flo.
+
+Another note; the 'requeue_flos' list inside the transit tuple has a max length config variable. This helps to prevent infinite loops and recursive bugs etc. If limit is reached the event will error out with {:error, event, transit_data[errors]}
+
+In summary, here are the logical steps in order:
+
+1. Event goes through pipeline until it hits a subflo stage
+2. The exit subflo consumer checks config limit then appends requeue info to event
+3. Exit subflo consumer sends event to the child queue
+4. At the end of child flo, the normal exit consumer checks for requeue info and sends event back to parent queue.
+5. The parent flo producer checks the requeue list for its own id. If found it removes list item and routes event to the correct partition.
+
+## Useful Libraries
+
+* [Json Pointers](https://github.com/odogono/elixir-jsonpointer)
+* Queues
+  * [ecto job](https://github.com/mbuhot/ecto_job)
+  * [rihanna](https://github.com/samsondav/rihanna)
+  * [oban](https://github.com/sorentwo/oban)
+  * [eternal ets](https://github.com/whitfin/eternal)
+* [Warpath jsonpathx](https://github.com/Cleidiano/warpath/)
+* [Phoenix api rate limiting](https://github.com/michalmuskala/plug_attack)
+* String scripts
+  * [abacus](https://github.com/narrowtux/abacus)
+  * [evalex](https://github.com/fabriziosestito/evalex)
